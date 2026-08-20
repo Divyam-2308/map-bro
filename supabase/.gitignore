@@ -1,0 +1,9 @@
+# Supabase CLI local cache and branches
+.branches
+.temp
+
+# Environment and key files
+.env.keys
+.env.local
+.env.*.local
+*.log
