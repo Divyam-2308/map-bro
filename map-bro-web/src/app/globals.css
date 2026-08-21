@@ -1,6 +1,10 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+@plugin "daisyui" {
+  themes: light --default;
+  prefix: dy-;
+}
 
 @custom-variant dark (&:is(.dark *));
 

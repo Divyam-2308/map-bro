@@ -12,6 +12,7 @@
     "@maplibre/maplibre-gl-leaflet": "^0.1.4",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "daisyui": "^5.7.20",
     "leaflet": "^1.9.4",
     "lucide-react": "^1.33.0",
     "maplibre-gl": "^6.4.1",

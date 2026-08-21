@@ -26,6 +26,10 @@ import {
   type CadastralStateId,
 } from "@/components/map/cadastrals";
 import { MapControls } from "@/components/map/map-controls";
+import {
+  SearchPanel,
+  type CadastralSearchResult,
+} from "@/components/map/search-panel";
 import { loadMapSettings, saveMapSettings } from "@/lib/map-settings";
 
 export function MapView() {
@@ -62,10 +66,16 @@ export function MapView() {
 
   // Fetch the dynamic (ArcGIS) sources' features for the current viewport so
   // parcels render in the app's own vector style at the right zoom.
+  // Deliberately doesn't gate on `isStyleLoaded()` — that also waits for
+  // every other selected state's raster/vector tiles to finish loading,
+  // which with several states selected is essentially never true during
+  // normal panning. `getSource` is safe to call before the style is fully
+  // ready (it just returns undefined), so each source is skipped until
+  // `applyCadastralStates` has actually added it.
   const refreshDynamicSources = () => {
     const map = mapRef.current;
     const glMap = cadastralRef.current?.getMaplibreMap();
-    if (!map || !glMap || !glMap.isStyleLoaded()) return;
+    if (!map || !glMap) return;
     const bounds = map.getBounds();
     const viewport = {
       west: bounds.getWest(),
@@ -260,8 +270,7 @@ export function MapView() {
     if (layer) {
       const glMap = layer.getMaplibreMap();
       if (glMap) {
-        applyCadastralStates(glMap, selected);
-        refreshDynamicSources();
+        applyCadastralStates(glMap, selected, refreshDynamicSources);
         if (shouldFly) {
           map.flyTo(selected[0].focus, selected[0].zoom);
         }
@@ -280,10 +289,7 @@ export function MapView() {
     cadastralRef.current = glLayer;
 
     const glMap = glLayer.getMaplibreMap();
-    applyCadastralStates(glMap, selected);
-    // The style may not be loaded yet; fetch the dynamic sources once it is.
-    glMap.once("load", refreshDynamicSources);
-    refreshDynamicSources();
+    applyCadastralStates(glMap, selected, refreshDynamicSources);
     if (shouldFly) {
       map.flyTo(selected[0].focus, selected[0].zoom);
     }
@@ -334,6 +340,37 @@ export function MapView() {
     return () => observer.disconnect();
   }, []);
 
+  // Fly to and highlight the parcel(s) returned by the search panel.
+  const handleSearchResult = ({ stateId, features }: CadastralSearchResult) => {
+    const map = mapRef.current;
+    if (!map || features.length === 0) return;
+
+    setCadastralVisible(true);
+    setCadastralStates((prev) =>
+      prev.includes(stateId) ? prev : [...prev, stateId],
+    );
+
+    const collection: GeoJSON.FeatureCollection = {
+      type: "FeatureCollection",
+      features,
+    };
+    const bounds = L.geoJSON(collection).getBounds();
+    if (!bounds.isValid()) return;
+
+    map.flyToBounds(bounds, { maxZoom: 17, padding: [80, 80] });
+
+    const props = features[0].properties as Record<string, unknown> | undefined;
+    if (!props) return;
+    const rows = Object.entries(props)
+      .filter(([, v]) => v !== null && v !== undefined && v !== "")
+      .map(([k, v]) => `<tr><th>${k}</th><td>${String(v)}</td></tr>`)
+      .join("");
+    L.popup()
+      .setLatLng(bounds.getCenter())
+      .setContent(`<table class="cadastral-popup">${rows}</table>`)
+      .openOn(map);
+  };
+
   return (
     <div className="absolute inset-0 isolate">
       <div
@@ -341,6 +378,7 @@ export function MapView() {
         aria-label="Interactive map with satellite imagery, topographic and cadastral overlays"
         className="absolute inset-0"
       />
+      <SearchPanel onResult={handleSearchResult} />
       <MapControls
         basemap={basemap}
         onBasemapChange={setBasemap}
