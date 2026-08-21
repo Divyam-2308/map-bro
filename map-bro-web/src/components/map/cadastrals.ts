@@ -1,7 +1,9 @@
 import type {
   ExpressionSpecification,
+  GeoJSONSourceSpecification,
   LayerSpecification,
   Map as MapLibreMap,
+  RasterSourceSpecification,
   StyleSpecification,
   VectorSourceSpecification,
 } from "maplibre-gl";
@@ -25,19 +27,33 @@ export interface CadastralSource {
   id: string;
   /** Full provider name, shown in the picker and attribution. */
   provider: string;
-  /** XYZ vector-tile (pbf) template. */
+  /** "vector" for pbf vector tiles, "raster" for cached raster (e.g. ArcGIS),
+   *  "dynamic" for per-viewport vector queries (e.g. ArcGIS Dynamic MapServer). */
+  kind: "vector" | "raster" | "dynamic";
+  /** XYZ tile template ({z}/{x}/{y}); unused for "dynamic". */
   tiles: string;
   minZoom: number;
   maxZoom: number;
-  /** Vector layer id inside the tiles. */
-  layerId: string;
-  /** Parcel/survey-number fields, tried in order for the label. */
+  /** Vector layer id inside the tiles (vector sources only). */
+  layerId?: string;
+  /** Parcel/survey-number fields, tried in order for the label (vector/dynamic). */
   labelFields: string[];
   attribution: string;
   sourceUrl: string;
   /** When false the source renders outlines only (used to merge overlapping
    *  sources for the same state without double-drawing fills/labels). */
   primary: boolean;
+  /** Dynamic-source config: how to fetch features for the current viewport. */
+  dynamic?: {
+    /** ArcGIS Dynamic MapServer base URL (e.g. …/Dynamic_…/MapServer). */
+    queryUrl: string;
+    /** ArcGIS layer ids to query, in increasing detail order. */
+    layerIds: number[];
+    /** Zoom at which each corresponding layer becomes active. */
+    layerMinZooms: number[];
+    /** Maximum features to fetch per refresh (cap on records/pages). */
+    maxFeatures: number;
+  };
 }
 
 export interface CadastralState {
@@ -66,6 +82,7 @@ const base = "https://indianopenmaps.com/not-so-open/cadastrals";
 const NCSCM = (state: string, layer: string, fields: string[]) =>
   ({
     id: `${state}-ncscm`,
+    kind: "vector",
     provider: "NCSCM (Coastal)",
     tiles: `${base}/${state}/coastal/ncscm/{z}/{x}/{y}.pbf`,
     minZoom: 0,
@@ -79,6 +96,7 @@ const NCSCM = (state: string, layer: string, fields: string[]) =>
 const NCOG = (state: string, layer: string, fields: string[]) =>
   ({
     id: `${state}-ncog`,
+    kind: "vector",
     provider: "NCOG (Govt. of India)",
     tiles: `${base}/${state}/ncog/{z}/{x}/{y}.pbf`,
     minZoom: 0,
@@ -92,6 +110,7 @@ const NCOG = (state: string, layer: string, fields: string[]) =>
 const MATRI = (state: string, layer: string, fields: string[]) =>
   ({
     id: `${state}-matribhoomi`,
+    kind: "vector",
     provider: "Matribhoomi (Bharatmaps)",
     tiles: `${base}/${state}/matribhoomi/{z}/{x}/{y}.pbf`,
     minZoom: 1,
@@ -130,6 +149,7 @@ export const CADASTRAL_STATES: Record<CadastralStateId, CadastralState> = {
       {
         id: "gujarat-vedas",
         provider: "VEDAS (SAC–ISRO)",
+        kind: "vector",
         tiles: `${base}/gujarat/vedas/{z}/{x}/{y}.pbf`,
         minZoom: 0,
         maxZoom: 13,
@@ -259,13 +279,42 @@ export const CADASTRAL_STATES: Record<CadastralStateId, CadastralState> = {
   karnataka: {
     id: "karnataka",
     name: "Karnataka",
-    coverage: "Coastal",
-    focus: [13.0, 76.0],
-    zoom: 7,
+    coverage: "Statewide · KGIS (KSRSAC)",
+    focus: [15.0, 75.7],
+    zoom: 8,
     sources: [
       {
-        ...NCSCM("karnataka", "NCSCM_KN_Cadastrals", ["Survey_Number"]),
+        id: "kgis",
+        kind: "dynamic",
+        provider: "KGIS (KSRSAC)",
+        tiles: "",
+        minZoom: 0,
+        maxZoom: 19,
+        labelFields: [
+          "Label",
+          "Surveynumber",
+          "Surveynumber_Old",
+          "Surnoc",
+          "KGISVillageName",
+          "KGISHobliName",
+          "KGISTalukName",
+          "KGISDistrictName",
+        ],
+        attribution: `Source: <a href="https://kgis.ksrsac.in/" target="_blank" rel="noopener noreferrer">Karnataka State Remote Sensing Applications Centre</a> &mdash; cadastral &amp; admin boundaries`,
+        sourceUrl: "https://kgis.ksrsac.in/",
         primary: true,
+        dynamic: {
+          queryUrl:
+            "https://kgis.ksrsac.in/kgismaps1/rest/services/CadastralData_Admin/Dynamic_CadastralData_Admin/MapServer",
+          layerIds: [1, 2, 3, 4, 5],
+          // District → Taluk → Hobli → Village → Cadastral as you zoom in,
+          // mirroring the source's own scale-gated layers.
+          layerMinZooms: [0, 4, 6, 8, 11],
+          maxFeatures: 8000,
+        },
+      },
+      {
+        ...NCSCM("karnataka", "NCSCM_KN_Cadastrals", ["Survey_Number"]),
       },
     ],
   },
@@ -313,6 +362,8 @@ const lineLayer = (stateId: CadastralStateId, source: CadastralSource) =>
   `${sourceId(stateId, source)}-line`;
 const labelLayer = (stateId: CadastralStateId, source: CadastralSource) =>
   `${sourceId(stateId, source)}-label`;
+const rasterLayer = (stateId: CadastralStateId, source: CadastralSource) =>
+  `${sourceId(stateId, source)}-raster`;
 
 /** Empty base style; the cadastral sources + layers are applied on load. */
 export function cadastralBaseStyle(): StyleSpecification {
@@ -326,22 +377,40 @@ export function cadastralBaseStyle(): StyleSpecification {
 
 export function buildCadastralSource(
   source: CadastralSource,
-): VectorSourceSpecification {
-  return {
-    type: "vector",
-    tiles: [source.tiles],
+): VectorSourceSpecification | RasterSourceSpecification | GeoJSONSourceSpecification {
+  if (source.kind === "dynamic") {
+    return {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: [] },
+      attribution: source.attribution,
+    };
+  }
+  const common = {
     minzoom: source.minZoom,
     maxzoom: source.maxZoom,
     scheme: "xyz",
     attribution: source.attribution,
-  };
+  } as const;
+  if (source.kind === "raster") {
+    return { ...common, type: "raster", tiles: [source.tiles] };
+  }
+  return { ...common, type: "vector", tiles: [source.tiles] };
 }
 
-/** Layer ids to query when clicking; primary sources also expose labels. */
+/** Layer ids to query when clicking; primary sources also expose labels.
+ *  Raster sources carry no attributes, so they are never queried. */
 export function cadastralQueryLayers(
   stateId: CadastralStateId,
   source: CadastralSource,
 ): string[] {
+  if (source.kind === "raster") return [];
+  if (source.kind === "dynamic") {
+    return [
+      fillLayer(stateId, source),
+      lineLayer(stateId, source),
+      labelLayer(stateId, source),
+    ];
+  }
   return source.primary
     ? [
         fillLayer(stateId, source),
@@ -355,6 +424,24 @@ export function buildCadastralLayers(
   stateId: CadastralStateId,
   source: CadastralSource,
 ): LayerSpecification[] {
+  if (source.kind === "raster") {
+    return [
+      {
+        id: rasterLayer(stateId, source),
+        type: "raster",
+        source: sourceId(stateId, source),
+        paint: {
+          "raster-opacity": 1,
+          "raster-resampling": "linear",
+          "raster-fade-duration": 0,
+        },
+      },
+    ];
+  }
+
+  // Dynamic sources render like a primary vector source (fill + line + label).
+  const isDynamic = source.kind === "dynamic";
+
   const textField: ExpressionSpecification = [
     "coalesce",
     ...source.labelFields.map((field) => ["get", field] as ExpressionSpecification),
@@ -366,7 +453,7 @@ export function buildCadastralLayers(
       id: lineLayer(stateId, source),
       type: "line",
       source: sourceId(stateId, source),
-      "source-layer": source.layerId,
+      ...(isDynamic ? {} : { "source-layer": source.layerId }),
       paint: {
         "line-color": "#1d4ed8",
         "line-width": [
@@ -390,13 +477,13 @@ export function buildCadastralLayers(
     },
   ];
 
-  if (source.primary) {
+  if (source.primary || isDynamic) {
     layers.unshift(
       {
         id: fillLayer(stateId, source),
         type: "fill",
         source: sourceId(stateId, source),
-        "source-layer": source.layerId,
+        ...(isDynamic ? {} : { "source-layer": source.layerId }),
         paint: {
           "fill-color": "#3b82f6",
           "fill-opacity": [
@@ -414,7 +501,7 @@ export function buildCadastralLayers(
         id: labelLayer(stateId, source),
         type: "symbol",
         source: sourceId(stateId, source),
-        "source-layer": source.layerId,
+        ...(isDynamic ? {} : { "source-layer": source.layerId }),
         layout: {
           "text-field": textField,
           "text-font": ["Open Sans Regular"],
@@ -461,7 +548,7 @@ export function applyCadastralStates(
     for (const layerId of map.getStyle().layers
       .map((layer) => layer.id)
       .filter((id) => id.startsWith("cadastral-"))) {
-      if (!wanted.has(layerId.replace(/-fill$|-line$|-label$/, "")) && map.getLayer(layerId)) {
+      if (!wanted.has(layerId.replace(/-fill$|-line$|-label$|-raster$/, "")) && map.getLayer(layerId)) {
         map.removeLayer(layerId);
       }
     }
@@ -492,4 +579,84 @@ export function applyCadastralStates(
   } else {
     map.once("load", apply);
   }
+}
+
+export interface ViewportBounds {
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+}
+
+/** Returns the layer index of a dynamic source whose layerMinZooms best matches
+ *  the current zoom (the last layer whose min zoom is reached). */
+function activeDynamicLayer(
+  source: CadastralSource,
+  zoom: number,
+): number | null {
+  const cfg = source.dynamic;
+  if (!cfg) return null;
+  let active: number | null = null;
+  for (let i = 0; i < cfg.layerIds.length; i++) {
+    if (zoom >= cfg.layerMinZooms[i]) active = cfg.layerIds[i];
+  }
+  return active;
+}
+
+const DYNAMIC_PAGE_SIZE = 1000;
+
+/**
+ * Queries an ArcGIS Dynamic MapServer feature layer for the features that
+ * intersect the given viewport and returns them as a GeoJSON FeatureCollection.
+ * Paging continues until maxFeatures is reached or the server stops returning
+ * results, so a busy viewport degrades gracefully instead of truncating hard.
+ */
+export async function queryDynamicSource(
+  source: CadastralSource,
+  zoom: number,
+  bounds: ViewportBounds,
+): Promise<GeoJSON.FeatureCollection> {
+  const cfg = source.dynamic;
+  const layerId = cfg ? activeDynamicLayer(source, zoom) : null;
+  if (!cfg || layerId === null) {
+    return { type: "FeatureCollection", features: [] };
+  }
+
+  const geometry = {
+    xmin: bounds.west,
+    ymin: bounds.south,
+    xmax: bounds.east,
+    ymax: bounds.north,
+    spatialReference: { wkid: 4326 },
+  };
+  const base = `${cfg.queryUrl}/${layerId}/query`;
+
+  const features: GeoJSON.Feature[] = [];
+  let offset = 0;
+  while (features.length < cfg.maxFeatures) {
+    const params = new URLSearchParams({
+      where: "1=1",
+      outFields: "*",
+      returnGeometry: "true",
+      outSR: "4326",
+      f: "geojson",
+      geometryType: "esriGeometryEnvelope",
+      geometry: JSON.stringify(geometry),
+      spatialRel: "esriSpatialRelIntersects",
+      resultOffset: String(offset),
+      resultRecordCount: String(DYNAMIC_PAGE_SIZE),
+    });
+
+    const res = await fetch(`${base}?${params.toString()}`);
+    if (!res.ok) break;
+    const json = (await res.json()) as GeoJSON.FeatureCollection & {
+      exceededTransferLimit?: boolean;
+    };
+    const page = json.features ?? [];
+    features.push(...page);
+    if (!json.exceededTransferLimit || page.length < DYNAMIC_PAGE_SIZE) break;
+    offset += page.length;
+  }
+
+  return { type: "FeatureCollection", features };
 }

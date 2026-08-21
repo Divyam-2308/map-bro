@@ -22,6 +22,7 @@ import {
   applyCadastralStates,
   cadastralBaseStyle,
   cadastralQueryLayers,
+  queryDynamicSource,
   type CadastralStateId,
 } from "@/components/map/cadastrals";
 import { MapControls } from "@/components/map/map-controls";
@@ -59,6 +60,37 @@ export function MapView() {
   const cadastralPrevStatesRef = useRef<CadastralStateId[]>(cadastralStates);
   const cadastralPrevVisibleRef = useRef(cadastralVisible);
 
+  // Fetch the dynamic (ArcGIS) sources' features for the current viewport so
+  // parcels render in the app's own vector style at the right zoom.
+  const refreshDynamicSources = () => {
+    const map = mapRef.current;
+    const glMap = cadastralRef.current?.getMaplibreMap();
+    if (!map || !glMap || !glMap.isStyleLoaded()) return;
+    const bounds = map.getBounds();
+    const viewport = {
+      west: bounds.getWest(),
+      south: bounds.getSouth(),
+      east: bounds.getEast(),
+      north: bounds.getNorth(),
+    };
+    const zoom = map.getZoom();
+    for (const stateId of cadastralStatesRef.current) {
+      for (const source of CADASTRAL_STATES[stateId].sources) {
+        if (source.kind !== "dynamic") continue;
+        const id = `cadastral-${stateId}-${source.id}`;
+        const glSource = glMap.getSource(id);
+        if (!glSource || glSource.type !== "geojson") continue;
+        void queryDynamicSource(source, zoom, viewport).then((data) => {
+          // Guard against a stale source (state toggled mid-fetch).
+          const current = glMap.getSource(id);
+          if (current && current.type === "geojson") {
+            (current as maplibregl.GeoJSONSource).setData(data);
+          }
+        });
+      }
+    }
+  };
+
   // Create the map once. Layer add/remove/opacity is handled by the
   // effect hooks below so state changes map 1:1 to layer mutations.
   useEffect(() => {
@@ -86,6 +118,7 @@ export function MapView() {
         center: [center.lat, center.lng],
         zoom: map.getZoom(),
       });
+      refreshDynamicSources();
     });
 
     // Show the clicked parcel's attributes (survey no, owner info, etc.).
@@ -228,6 +261,7 @@ export function MapView() {
       const glMap = layer.getMaplibreMap();
       if (glMap) {
         applyCadastralStates(glMap, selected);
+        refreshDynamicSources();
         if (shouldFly) {
           map.flyTo(selected[0].focus, selected[0].zoom);
         }
@@ -245,7 +279,11 @@ export function MapView() {
     glLayer.getContainer().style.opacity = String(cadastralOpacityRef.current);
     cadastralRef.current = glLayer;
 
-    applyCadastralStates(glLayer.getMaplibreMap(), selected);
+    const glMap = glLayer.getMaplibreMap();
+    applyCadastralStates(glMap, selected);
+    // The style may not be loaded yet; fetch the dynamic sources once it is.
+    glMap.once("load", refreshDynamicSources);
+    refreshDynamicSources();
     if (shouldFly) {
       map.flyTo(selected[0].focus, selected[0].zoom);
     }
